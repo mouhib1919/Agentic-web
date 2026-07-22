@@ -22,6 +22,16 @@ from models.evidence import WebsiteEvidence
 URL = "https://www.example.com"
 
 
+def _print_result(label: str, result) -> None:
+    print(f"--- {label} ---")
+    print(f"score:           {result.score}")
+    print(f"checks:          {result.checks}")
+    print(f"details:         {result.details}")
+    print(f"issues:          {result.issues}")
+    print(f"recommendations: {result.recommendations}")
+    print()
+
+
 def _perfect_evidence() -> WebsiteEvidence:
     """Build a `WebsiteEvidence` that should pass every criterion."""
     return WebsiteEvidence(
@@ -51,6 +61,7 @@ def test_perfect_website_scores_100() -> None:
     agent = DiscoverabilityAgent()
 
     result = agent.evaluate(_perfect_evidence())
+    _print_result("perfect website", result)
 
     assert result.score == 100.0
     assert all(result.checks.values())
@@ -67,6 +78,7 @@ def test_missing_robots_txt() -> None:
     evidence.robots_txt = None
 
     result = agent.evaluate(evidence)
+    _print_result("missing robots.txt", result)
 
     assert result.checks["robots_txt"] is False
     assert "No robots.txt found" in result.issues
@@ -80,6 +92,7 @@ def test_missing_sitemap() -> None:
     evidence.sitemap_xml = None
 
     result = agent.evaluate(evidence)
+    _print_result("missing sitemap.xml", result)
 
     assert result.checks["sitemap"] is False
     assert "No sitemap.xml found" in result.issues
@@ -93,6 +106,7 @@ def test_missing_llms_txt() -> None:
     evidence.llms_txt = None
 
     result = agent.evaluate(evidence)
+    _print_result("missing llms.txt", result)
 
     assert result.checks["llms_txt"] is False
     assert "No llms.txt found" in result.issues
@@ -108,6 +122,7 @@ def test_no_metadata() -> None:
     evidence.canonical = None
 
     result = agent.evaluate(evidence)
+    _print_result("no metadata", result)
 
     assert result.checks["metadata"] is False
     assert any("Missing metadata" in issue for issue in result.issues)
@@ -121,6 +136,7 @@ def test_no_open_graph() -> None:
     evidence.open_graph = {}
 
     result = agent.evaluate(evidence)
+    _print_result("no Open Graph", result)
 
     assert result.checks["open_graph"] is False
     assert "No Open Graph metadata found" in result.issues
@@ -141,6 +157,7 @@ def test_no_api_discoverability() -> None:
     }
 
     result = agent.evaluate(evidence)
+    _print_result("no API discoverability", result)
 
     assert result.checks["api_discoverability"] is False
     assert "No API documentation found" in result.issues
@@ -154,6 +171,7 @@ def test_no_internal_links() -> None:
     evidence.internal_links = []
 
     result = agent.evaluate(evidence)
+    _print_result("no internal links", result)
 
     assert result.checks["internal_links"] is False
     assert "No internal navigation links found" in result.issues
@@ -166,6 +184,7 @@ def test_everything_missing_scores_near_zero() -> None:
     evidence = WebsiteEvidence(url=URL)
 
     result = agent.evaluate(evidence)
+    _print_result("everything missing", result)
 
     assert result.score == 0.0
     assert all(passed is False for passed in result.checks.values())
