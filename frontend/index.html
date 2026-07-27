@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ARAS — Agentic Readiness Assessment System</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <div class="hero__badge">AI Agent Readiness</div>
+      <h1>ARAS</h1>
+      <p class="hero__subtitle">Agentic Readiness Assessment System</p>
+      <p class="hero__description">
+        ARAS audits a website across four dimensions — discoverability, comprehension,
+        interaction, and security — then generates a global readiness score and a
+        downloadable PDF report with concrete, AI-agent-focused recommendations.
+      </p>
+    </header>
+
+    <main class="card">
+      <form id="analyze-form" class="analyze-form">
+        <label for="url-input" class="analyze-form__label">Website URL</label>
+        <div class="analyze-form__row">
+          <input
+            id="url-input"
+            name="url"
+            type="text"
+            placeholder="https://example.com"
+            autocomplete="off"
+            required
+          />
+          <button type="submit" id="analyze-button">Analyze Website</button>
+        </div>
+      </form>
+
+      <p id="error-banner" class="error-banner" hidden></p>
+
+      <section id="progress-section" class="progress-section" hidden>
+        <h2>Analysis in progress</h2>
+        <ul id="stage-list" class="stage-list"></ul>
+      </section>
+
+      <section id="results-section" class="results-section" hidden>
+        <h2>Assessment completed</h2>
+
+        <div class="results-summary">
+          <div class="score-card">
+            <div id="score-value" class="score-card__value">--</div>
+            <div class="score-card__label">Global ARAS Score</div>
+            <div id="readiness-level" class="score-card__level"></div>
+          </div>
+
+          <div class="issues-card">
+            <div class="issue-badge issue-badge--high">
+              <span id="issues-high">0</span> HIGH
+            </div>
+            <div class="issue-badge issue-badge--medium">
+              <span id="issues-medium">0</span> MEDIUM
+            </div>
+            <div class="issue-badge issue-badge--low">
+              <span id="issues-low">0</span> LOW
+            </div>
+            <p class="issues-card__recommendations">
+              <span id="recommendations-count">0</span> recommendations generated
+            </p>
+          </div>
+        </div>
+
+        <p id="workflow-warning" class="workflow-warning" hidden></p>
+
+        <a id="download-button" class="download-button" href="#" download hidden>
+          Download PDF Report
+        </a>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <p>ARAS — internal demo. Analysis powered by an existing multi-agent LangGraph pipeline.</p>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

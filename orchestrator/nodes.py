@@ -20,10 +20,15 @@ from agents.comprehension_agent import ComprehensionAgent
 from agents.discoverability_agent import DiscoverabilityAgent
 from agents.evidence_collector import EvidenceCollectorAgent
 from agents.interaction_agent import InteractionAgent
+from agents.reporter_agent import ReporterAgent
+from agents.rule_engine import RuleEngine
 from agents.scoring_agent import ScoringAgent
 from agents.security_agent import SecurityAgent
 from models.evidence import WebsiteEvidence
 from orchestrator.state import ARASState
+from recommendation.agent import RecommendationAgent
+from recommendation.rag.retriever import KnowledgeRetriever
+from recommendation.rag.vector_store import VectorStoreManager
 
 # ---------------------------------------------------------------------------
 # Evidence Collector node
@@ -176,3 +181,122 @@ def scoring_node(state: ARASState) -> dict[str, Any]:
         return {"global_result": None, "errors": [f"global_result: {exc}"]}
 
     return {"global_result": result}
+
+
+# ---------------------------------------------------------------------------
+# Rule Engine node
+# ---------------------------------------------------------------------------
+
+
+def rule_engine_node(state: ARASState) -> dict[str, Any]:
+    """Classify every reported issue via `RuleEngine.evaluate()`.
+
+    Reads the four analysis results directly (not `global_result`):
+    the Rule Engine classifies individual `issues` messages, which live
+    on the analysis results themselves, not on the aggregate score.
+
+    Args:
+        state: The current workflow state. Reads
+            `discoverability_result`, `comprehension_result`,
+            `interaction_result`, and `security_result`.
+
+    Returns:
+        A partial state update setting `rule_engine_result`.
+    """
+    try:
+        result = RuleEngine().evaluate(
+            {
+                "discoverability": state.get("discoverability_result"),
+                "comprehension": state.get("comprehension_result"),
+                "interaction": state.get("interaction_result"),
+                "security": state.get("security_result"),
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - isolate agent failure from the graph
+        return {"rule_engine_result": None, "errors": [f"rule_engine_result: {exc}"]}
+
+    return {"rule_engine_result": result}
+
+
+# ---------------------------------------------------------------------------
+# Recommendation node
+# ---------------------------------------------------------------------------
+
+
+def recommendation_node(state: ARASState) -> dict[str, Any]:
+    """Generate recommendations for every classified issue.
+
+    Calls `RecommendationAgent.generate()` with a `KnowledgeRetriever`
+    loaded from the already-persisted ChromaDB collection (built
+    earlier, offline, by the ingestion + vector-store pipeline) — this
+    node never builds embeddings or a vector store itself, only loads
+    what already exists. If no persisted collection is found, the
+    retriever is left uninitialized and `RecommendationAgent` falls
+    back to generating recommendations from issue information alone
+    (its own documented Case 1 behavior).
+
+    Args:
+        state: The current workflow state. Reads `rule_engine_result`.
+
+    Returns:
+        A partial state update setting `recommendation_result`.
+    """
+    rule_engine_result = state.get("rule_engine_result")
+    if rule_engine_result is None:
+        return {
+            "recommendation_result": None,
+            "errors": ["recommendation_result: no classified issues available"],
+        }
+
+    try:
+        retriever = KnowledgeRetriever()
+        try:
+            retriever.initialize(str(VectorStoreManager().persist_directory))
+        except FileNotFoundError:
+            pass  # RecommendationAgent handles an uninitialized retriever gracefully.
+
+        result = RecommendationAgent(retriever=retriever).generate(rule_engine_result.issues)
+    except Exception as exc:  # noqa: BLE001 - isolate agent failure from the graph
+        return {"recommendation_result": None, "errors": [f"recommendation_result: {exc}"]}
+
+    return {"recommendation_result": result}
+
+
+# ---------------------------------------------------------------------------
+# Reporter node
+# ---------------------------------------------------------------------------
+
+
+def reporter_node(state: ARASState) -> dict[str, Any]:
+    """Render the final PDF report via `ReporterAgent.generate()`.
+
+    Runs last, after every other result (or `None`, for any stage that
+    failed) is already in `state`. `ReporterAgent` itself tolerates
+    missing sections (it notes them in the report rather than
+    raising), so the report is generated even if analysis, scoring,
+    classification, or recommendation generation partially failed.
+
+    Args:
+        state: The current workflow state. Reads `url`, `evidence`,
+            every `*_result` field, and `errors`.
+
+    Returns:
+        A partial state update setting `report_result`.
+    """
+    try:
+        result = ReporterAgent().generate(
+            url=state["url"],
+            evidence=state.get("evidence"),
+            discoverability_result=state.get("discoverability_result"),
+            comprehension_result=state.get("comprehension_result"),
+            interaction_result=state.get("interaction_result"),
+            security_result=state.get("security_result"),
+            scoring_result=state.get("global_result"),
+            rule_engine_result=state.get("rule_engine_result"),
+            recommendation_result=state.get("recommendation_result"),
+            errors=state.get("errors", []),
+        )
+    except Exception as exc:  # noqa: BLE001 - isolate agent failure from the graph
+        return {"report_result": None, "errors": [f"report_result: {exc}"]}
+
+    return {"report_result": result}

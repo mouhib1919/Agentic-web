@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: aras-demo
+    env: python
+    plan: starter # free tier is often too memory-constrained for torch + sentence-transformers
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: GROQ_API_KEY
+        sync: false # set the real value in the Render dashboard, never commit it

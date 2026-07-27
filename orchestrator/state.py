@@ -14,6 +14,9 @@ from models.comprehension import ComprehensionResult
 from models.discoverability import DiscoverabilityResult
 from models.evidence import WebsiteEvidence
 from models.interaction import InteractionResult
+from models.recommendation import RecommendationResult
+from models.report import ReportResult
+from models.rule_engine import RuleEngineResult
 from models.scoring import GlobalReadinessResult
 from models.security import SecurityResult
 
@@ -41,16 +44,22 @@ class ARASState(TypedDict):
             not yet evaluated or evaluation failed.
         security_result: Output of `SecurityAgent`, or `None` if not
             yet evaluated or evaluation failed.
-        global_result: Output of `ScoringAgent`, aggregating the four
-            `*_result` fields into a single Agentic Readiness score,
-            or `None` if not yet computed.
+        global_result: Output of `ScoringAgent` (the "scoring result"),
+            aggregating the four `*_result` fields into a single
+            Agentic Readiness score, or `None` if not yet computed.
+        rule_engine_result: Output of `RuleEngine`, classifying every
+            issue reported by the four analysis results into a
+            prioritized, topic-tagged `ClassifiedIssue` list, or
+            `None` if not yet computed.
+        recommendation_result: Output of `RecommendationAgent`,
+            expanding each classified issue into a grounded,
+            actionable recommendation via RAG retrieval + LLM
+            generation, or `None` if not yet computed.
+        report_result: Output of `ReporterAgent`, recording whether the
+            final PDF report was rendered and where, or `None` if not
+            yet attempted.
         errors: Human-readable messages describing any node failure,
             accumulated across the whole run.
-
-    Future extension point (deliberately absent for now, added once
-    that agent exists):
-        report_result: Output of a future Reporter Agent, rendering
-            the full state into a human-facing report.
     """
 
     url: str
@@ -60,4 +69,7 @@ class ARASState(TypedDict):
     interaction_result: Optional[InteractionResult]
     security_result: Optional[SecurityResult]
     global_result: Optional[GlobalReadinessResult]
+    rule_engine_result: Optional[RuleEngineResult]
+    recommendation_result: Optional[RecommendationResult]
+    report_result: Optional[ReportResult]
     errors: Annotated[list[str], operator.add]
