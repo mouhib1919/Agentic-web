@@ -16,7 +16,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from orchestrator.agent import ARASOrchestrator
+# `orchestrator.agent` transitively imports the Recommendation Agent's RAG
+# stack (langchain_huggingface -> sentence_transformers -> torch), which is
+# expensive to import (CPU time and RAM). Importing it lazily inside
+# `_run_job` — instead of at module load time — means the web process itself
+# starts cheaply and reliably (binds to $PORT immediately for platforms like
+# Render that health-check startup), and only pays that cost once an actual
+# analysis is requested.
 
 # Every LangGraph node name, grouped into the five user-facing stages
 # requested for the demo UI. A stage is "done" once every node in its
@@ -143,6 +149,8 @@ def _run_job(job: Job) -> None:
     Args:
         job: The job to run and update in place.
     """
+    from orchestrator.agent import ARASOrchestrator  # see module-level comment on lazy import
+
     orchestrator = ARASOrchestrator()
     final_state: dict[str, Any] = {}
 
