@@ -82,7 +82,8 @@ class VectorStoreManager:
         Args:
             documents: Document chunks produced by
                 `KnowledgeIngestion.split_documents` (or `.ingest`),
-                with `category`/`topic`/`source`/`chunk_id` metadata.
+                with `category`/`criterion`/`section`/`source`/
+                `chunk_id` metadata.
 
         Returns:
             The `Chroma` vector store, backed by the persisted collection.

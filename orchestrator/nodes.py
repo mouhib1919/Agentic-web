@@ -27,7 +27,7 @@ from agents.security_agent import SecurityAgent
 from models.evidence import WebsiteEvidence
 from orchestrator.state import ARASState
 from recommendation.agent import RecommendationAgent
-from recommendation.rag.retriever import KnowledgeRetriever
+from recommendation.rag.retriever import ARASRetriever
 from recommendation.rag.vector_store import VectorStoreManager
 
 # ---------------------------------------------------------------------------
@@ -226,14 +226,14 @@ def rule_engine_node(state: ARASState) -> dict[str, Any]:
 def recommendation_node(state: ARASState) -> dict[str, Any]:
     """Generate recommendations for every classified issue.
 
-    Calls `RecommendationAgent.generate()` with a `KnowledgeRetriever`
+    Calls `RecommendationAgent.generate()` with an `ARASRetriever`
     loaded from the already-persisted ChromaDB collection (built
     earlier, offline, by the ingestion + vector-store pipeline) — this
     node never builds embeddings or a vector store itself, only loads
     what already exists. If no persisted collection is found, the
     retriever is left uninitialized and `RecommendationAgent` falls
     back to generating recommendations from issue information alone
-    (its own documented Case 1 behavior).
+    (its own documented gracefully-degraded behavior).
 
     Args:
         state: The current workflow state. Reads `rule_engine_result`.
@@ -249,7 +249,7 @@ def recommendation_node(state: ARASState) -> dict[str, Any]:
         }
 
     try:
-        retriever = KnowledgeRetriever()
+        retriever = ARASRetriever()
         try:
             retriever.initialize(str(VectorStoreManager().persist_directory))
         except FileNotFoundError:

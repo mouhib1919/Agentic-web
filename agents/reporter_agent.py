@@ -404,7 +404,7 @@ class ReporterAgent:
             )
         )
 
-        rows = [["Priority", "Category", "Issue", "Topic"]]
+        rows = [["Priority", "Category", "Issue", "Criterion"]]
         for issue in sorted(
             rule_engine_result.issues, key=lambda item: _PRIORITY_ORDER.get(item.priority, 3)
         ):
@@ -413,7 +413,7 @@ class ReporterAgent:
                     issue.priority,
                     issue.category,
                     self._escape(issue.issue),
-                    issue.knowledge_topic,
+                    issue.criterion or issue.knowledge_topic,
                 ]
             )
 

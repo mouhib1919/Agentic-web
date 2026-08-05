@@ -24,16 +24,20 @@ from models.rule_engine import ClassifiedIssue, RuleEngineResult
 
 @dataclass
 class _FakeAnalysisResult:
-    """Minimal stand-in for a *Result dataclass, exposing only `issues`.
+    """Minimal stand-in for a *Result dataclass, exposing `issues`/`score`/`checks`.
 
-    The Rule Engine only ever reads `.issues` off an analysis result,
-    so a lightweight fake keeps these tests focused on rule-engine
-    behavior rather than depending on constructing full
-    DiscoverabilityResult/ComprehensionResult/InteractionResult/
-    SecurityResult objects.
+    The Rule Engine reads `.issues` (which issues to classify),
+    `.score` (carried over verbatim into `ClassifiedIssue.score`), and
+    `.checks` (carried over into `ClassifiedIssue.evidence`) off an
+    analysis result. `score`/`checks` default to `0.0`/`{}` so existing
+    tests that only set `issues=[...]` are unaffected; the Rule Engine
+    also reads them defensively (`getattr` with a default), so even a
+    result object exposing only `issues` still classifies correctly.
     """
 
     issues: list[str] = field(default_factory=list)
+    score: float = 0.0
+    checks: dict[str, bool] = field(default_factory=dict)
 
 
 def _print_classified_issues(label: str, result: RuleEngineResult) -> None:
@@ -252,6 +256,153 @@ def test_no_issues_produces_empty_result() -> None:
     assert result.summary == {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
 
 
+# ---------------------------------------------------------------------------
+# RAG enrichment: criterion / score / evidence / retrieval_query
+#
+# These tests cover the Rule Engine's RAG-oriented output fields, added on
+# top of the (unchanged, still tested above) issue/priority classification.
+# ---------------------------------------------------------------------------
+
+_KNOWLEDGE_BASE_ROOT = Path(__file__).resolve().parent.parent / "knowledge" / "aras_knowledge"
+
+
+def _knowledge_base_criteria() -> set[tuple[str, str]]:
+    """Collect every real `(category, criterion)` pair from frontmatter on disk.
+
+    Filenames don't always match their `criterion:` frontmatter value
+    (e.g. `discoverability/robots.md` has `criterion: robots_txt`), so
+    matching must go through frontmatter, never the filename stem.
+
+    Returns:
+        Every `(category, criterion)` pair found across
+        `knowledge/aras_knowledge/`.
+    """
+    pairs: set[tuple[str, str]] = set()
+    for markdown_file in _KNOWLEDGE_BASE_ROOT.glob("*/*.md"):
+        category = markdown_file.parent.name
+        for line in markdown_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("criterion:"):
+                pairs.add((category, line.split(":", 1)[1].strip()))
+                break
+    return pairs
+
+
+def test_same_issue_count_and_priorities_as_before_enrichment() -> None:
+    """1) Enrichment does not change which issues are detected or their priority."""
+    engine = RuleEngine()
+
+    result = engine.evaluate(_mytek_analysis_results())
+
+    assert len(result.issues) == 4
+    assert result.summary == {"HIGH": 2, "MEDIUM": 1, "LOW": 1}
+    by_category = {issue.category: issue for issue in result.issues}
+    assert by_category["security"].priority == "HIGH"
+    assert by_category["comprehension"].priority == "MEDIUM"
+    assert by_category["interaction"].priority == "HIGH"
+    assert by_category["discoverability"].priority == "LOW"
+
+
+def test_every_issue_exposes_the_new_rag_fields() -> None:
+    """3) Every classified issue includes category/criterion/priority/issue/score/evidence/retrieval_query."""
+    engine = RuleEngine()
+
+    result = engine.evaluate(
+        {
+            "security": _FakeAnalysisResult(
+                issues=["Missing Content-Security-Policy header."],
+                score=71.43,
+                checks={"csp": False, "hsts": True},
+            ),
+        }
+    )
+
+    assert len(result.issues) == 1
+    classified = result.issues[0]
+    print(f"enriched issue: {classified}")
+
+    assert classified.category == "security"
+    assert classified.criterion == "csp"
+    assert classified.priority == "HIGH"
+    assert classified.issue == "Missing Content-Security-Policy header."
+    assert classified.score == 71.43
+    assert classified.evidence == {"csp": False}
+    assert classified.retrieval_query == {"category": "security", "criterion": "csp"}
+
+
+def test_evidence_is_empty_when_result_exposes_no_checks() -> None:
+    """evidence gracefully degrades to {} rather than guessing, when checks is unavailable."""
+    engine = RuleEngine()
+
+    result = engine.evaluate(
+        {"security": _FakeAnalysisResult(issues=["Missing Content-Security-Policy header."])}
+    )
+
+    assert result.issues[0].evidence == {}
+    assert result.issues[0].score == 0.0
+
+
+def test_retrieval_query_criteria_exactly_match_the_knowledge_base() -> None:
+    """4) retrieval_query's category/criterion fields resolve to a real knowledge base document.
+
+    Runs every rule (and every category default) through the Rule
+    Engine and checks that `retrieval_query` always points at a file
+    that actually exists under `knowledge/aras_knowledge/`, with that
+    file's own `criterion:` frontmatter matching exactly.
+    """
+    engine = RuleEngine()
+    analysis_results = {
+        "security": _FakeAnalysisResult(
+            issues=[
+                "Missing Content-Security-Policy header.",
+                "No HSTS header detected.",
+                "Missing X-Frame-Options header.",
+                "Missing MIME/XSS protection headers.",
+                "HTTPS is not enabled.",
+                "No recognized reverse proxy, CDN, or WAF detected.",
+                "The homepage did not respond with HTTP 200.",
+                "Some entirely novel security concern",
+            ]
+        ),
+        "interaction": _FakeAnalysisResult(
+            issues=[
+                "No executable API interaction surface detected.",
+                "No backend API endpoints detected",
+                "No GraphQL endpoint detected.",
+                "No API documentation available.",
+                "No MCP support detected.",
+                "No actionable frontend interaction detected.",
+            ]
+        ),
+        "comprehension": _FakeAnalysisResult(
+            issues=[
+                "No JSON-LD semantic information found",
+                "No Schema.org entities detected",
+                "No structured data found",
+                "Missing Open Graph metadata",
+                "Weak semantic representation",
+            ]
+        ),
+        "discoverability": _FakeAnalysisResult(
+            issues=["No sitemap.xml found", "No robots.txt found", "No llms.txt found"],
+        ),
+    }
+
+    result = engine.evaluate(analysis_results)
+    assert len(result.issues) == 22
+
+    known_pairs = _knowledge_base_criteria()
+    for classified in result.issues:
+        pair = (classified.category, classified.criterion)
+        assert pair in known_pairs, (
+            f"retrieval_query {classified.retrieval_query} for issue "
+            f"'{classified.issue}' has no matching knowledge base document"
+        )
+        assert classified.retrieval_query == {
+            "category": classified.category,
+            "criterion": classified.criterion,
+        }
+
+
 if __name__ == "__main__":
     test_mytek_analysis_results_are_classified_correctly()
     test_security_rules_cover_csp_hsts_and_headers()
@@ -261,4 +412,8 @@ if __name__ == "__main__":
     test_unmatched_issue_falls_back_to_category_default()
     test_missing_dimension_results_do_not_break_evaluation()
     test_no_issues_produces_empty_result()
+    test_same_issue_count_and_priorities_as_before_enrichment()
+    test_every_issue_exposes_the_new_rag_fields()
+    test_evidence_is_empty_when_result_exposes_no_checks()
+    test_retrieval_query_criteria_exactly_match_the_knowledge_base()
     print("All tests passed.")

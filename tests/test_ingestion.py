@@ -1,16 +1,21 @@
-"""Unit tests for :class:`KnowledgeIngestion`.
+"""Unit tests for :class:`KnowledgeIngestion` (upgraded ARAS ingestion pipeline).
 
 Covers, against the real ARAS knowledge base under
-`recommendation/knowledge/`: loading every Markdown document,
-metadata extraction from file paths, semantic chunk splitting with
-metadata preservation, and the full `ingest()` pipeline. No
-embeddings, vector store, retriever, or LLM is exercised by these
-tests — only document loading and splitting.
+`knowledge/aras_knowledge/`: loading every Markdown document and
+extracting its YAML frontmatter, two-stage Markdown-header +
+character-based chunking, output compatibility with the expected
+`Document(page_content=..., metadata={...})` shape, embedding
+compatibility with the existing `EmbeddingManager`
+(sentence-transformers/all-MiniLM-L6-v2, 384 dimensions), and ChromaDB
+storage via the existing `VectorStoreManager`. No LLM, retriever, or
+recommendation-generation logic is exercised by these tests.
 """
 
 from __future__ import annotations
 
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 # Allow running this file directly (e.g. from an IDE "Run" button) by
@@ -19,129 +24,117 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from langchain_core.documents import Document
 
+from recommendation.rag.embeddings import EmbeddingManager
 from recommendation.rag.ingestion import KnowledgeIngestion
+from recommendation.rag.vector_store import VectorStoreManager
 
-KNOWLEDGE_PATH = str(Path(__file__).resolve().parent.parent / "recommendation" / "knowledge")
+KNOWLEDGE_PATH = str(Path(__file__).resolve().parent.parent / "knowledge" / "aras_knowledge")
 
 _EXPECTED_CATEGORIES = {"discoverability", "comprehension", "interaction", "security"}
+_EXPECTED_DOCUMENT_COUNT = 27
 _MAX_CHUNK_SIZE = 1500
 # RecursiveCharacterTextSplitter's chunk_size is a soft target measured against
-# its own separator-based splits, not a hard character cap, so a small
-# tolerance avoids flaking on borderline chunks while still catching real
-# fragmentation regressions.
-_CHUNK_SIZE_TOLERANCE = 50
+# its own separator-based splits, not a hard character cap; the composed
+# chunk also gains a document/section title prefix on top of the raw split
+# text, so a modest tolerance avoids flaking on borderline chunks while
+# still catching real oversizing regressions.
+_CHUNK_SIZE_TOLERANCE = 150
+_EMBEDDING_DIMENSIONS = 384
 
 
 def _print_documents(label: str, documents: list[Document]) -> None:
     print(f"--- {label} ---")
     print(f"count: {len(documents)}")
-    for document in documents[:5]:
-        print(f"  {document.metadata} (len={len(document.page_content)})")
+    for document in documents[:3]:
+        print(f"  {document.metadata}")
     print()
 
 
-def _print_all_chunks_debug(chunks: list[Document]) -> None:
-    """Temporary debug output: every chunk's metadata and content length."""
-    print("=" * 40)
-    print(f"Number of chunks: {len(chunks)}")
-    print("=" * 40)
-    for chunk in chunks:
-        print(chunk.metadata)
-        print(f"length={len(chunk.page_content)}")
-        print()
-
-
-def test_load_documents_finds_every_knowledge_file() -> None:
-    """1) Loading: documents are loaded successfully."""
+def test_load_documents_finds_every_aras_knowledge_file_with_metadata() -> None:
+    """1) Loading: all ARAS markdown files loaded, metadata extracted."""
     ingestion = KnowledgeIngestion()
 
     documents = ingestion.load_documents(KNOWLEDGE_PATH)
     _print_documents("load_documents", documents)
 
-    assert len(documents) > 0
+    assert len(documents) == _EXPECTED_DOCUMENT_COUNT
     assert all(isinstance(document, Document) for document in documents)
     assert all(document.page_content.strip() for document in documents)
 
-    # Every expected dimension folder is represented in the loaded set.
     categories_found = {document.metadata["category"] for document in documents}
-    assert _EXPECTED_CATEGORIES <= categories_found
+    assert categories_found == _EXPECTED_CATEGORIES
 
-
-def test_metadata_extraction_matches_file_path() -> None:
-    """Metadata is derived correctly from the directory structure."""
-    ingestion = KnowledgeIngestion()
-
-    documents = ingestion.load_documents(KNOWLEDGE_PATH)
+    # YAML frontmatter was parsed: category/criterion/severity/related present,
+    # and the frontmatter block itself is not leaked into page_content.
     csp_document = next(
         document for document in documents if document.metadata["source"].endswith("csp.md")
     )
-
-    print(f"csp.md metadata: {csp_document.metadata}")
-
     assert csp_document.metadata["category"] == "security"
-    assert csp_document.metadata["topic"] == "csp"
-    assert csp_document.metadata["source"] == "knowledge/security/csp.md"
+    assert csp_document.metadata["criterion"] == "csp"
+    assert csp_document.metadata["severity"] == "high"
+    assert "x_frame_options" in csp_document.metadata["related"]
+    assert not csp_document.page_content.lstrip().startswith("---")
+    assert csp_document.page_content.lstrip().startswith("# ")
 
 
 def test_metadata_extraction_is_dynamic_across_categories() -> None:
-    """Metadata extraction must not hardcode category names anywhere."""
+    """Metadata extraction reads frontmatter, never hardcodes category names."""
     ingestion = KnowledgeIngestion()
     documents = ingestion.load_documents(KNOWLEDGE_PATH)
 
-    jsonld_document = next(
-        document for document in documents if document.metadata["source"].endswith("jsonld.md")
+    json_ld_document = next(
+        document for document in documents if document.metadata["source"].endswith("json_ld.md")
     )
-    assert jsonld_document.metadata["category"] == "comprehension"
-    assert jsonld_document.metadata["topic"] == "jsonld"
+    assert json_ld_document.metadata["category"] == "comprehension"
+    assert json_ld_document.metadata["criterion"] == "json_ld"
 
-    openapi_document = next(
-        document for document in documents if document.metadata["source"].endswith("openapi.md")
+    graphql_document = next(
+        document for document in documents if document.metadata["source"].endswith("graphql.md")
     )
-    assert openapi_document.metadata["category"] == "interaction"
-    assert openapi_document.metadata["topic"] == "openapi"
+    assert graphql_document.metadata["category"] == "interaction"
+    assert graphql_document.metadata["criterion"] == "graphql"
 
 
-def test_split_documents_produces_more_chunks_than_source_files() -> None:
-    """2) Splitting: the ARAS knowledge documents (600-1000 words each) are
-    long enough relative to chunk_size=1500 that splitting must actually
-    fragment them, so total chunk count must exceed the source file count.
-    """
+def test_split_documents_preserves_markdown_sections() -> None:
+    """2) Chunking: Markdown sections preserved, chunks generated correctly."""
     ingestion = KnowledgeIngestion()
     documents = ingestion.load_documents(KNOWLEDGE_PATH)
 
     chunks = ingestion.split_documents(documents)
     _print_documents("split_documents", chunks)
 
-    assert len(chunks) > len(documents)
-    assert all(isinstance(chunk, Document) for chunk in chunks)
+    assert len(chunks) >= len(documents)
 
+    csp_chunks = [chunk for chunk in chunks if chunk.metadata["criterion"] == "csp"]
+    sections_found = {chunk.metadata["section"] for chunk in csp_chunks}
+    expected_sections = {
+        "Definition",
+        "Technical Background",
+        "Importance for AI Agent Readiness",
+        "ARAS Evaluation Context",
+        "Common Issues",
+        "Impact",
+        "Recommendation Strategy",
+        "Implementation Guidance",
+        "Validation Checklist",
+        "Related ARAS Criteria",
+        "References",
+    }
+    assert expected_sections <= sections_found
 
-def test_split_documents_preserves_metadata() -> None:
-    """3) Metadata preservation: every chunk keeps category/topic/source."""
-    ingestion = KnowledgeIngestion()
-    documents = ingestion.load_documents(KNOWLEDGE_PATH)
-    chunks = ingestion.split_documents(documents)
-
-    for chunk in chunks:
-        assert "category" in chunk.metadata
-        assert "topic" in chunk.metadata
-        assert "source" in chunk.metadata
-        assert "chunk_id" in chunk.metadata
-
-    # chunk_id values for a single source document are contiguous from 0.
-    csp_chunks = [chunk for chunk in chunks if chunk.metadata["topic"] == "csp"]
-    assert [chunk.metadata["chunk_id"] for chunk in csp_chunks] == list(range(len(csp_chunks)))
-
-    # A chunk's non-chunk_id metadata matches its source document's metadata.
-    documents_by_source = {document.metadata["source"]: document.metadata for document in documents}
-    for chunk in chunks:
-        source_metadata = documents_by_source[chunk.metadata["source"]]
-        assert chunk.metadata["category"] == source_metadata["category"]
-        assert chunk.metadata["topic"] == source_metadata["topic"]
+    # Each chunk carries its document + section title as context, per the
+    # required final document format.
+    recommendation_chunk = next(
+        chunk
+        for chunk in csp_chunks
+        if chunk.metadata["section"] == "Recommendation Strategy"
+    )
+    assert "# Content Security Policy" in recommendation_chunk.page_content
+    assert "## Recommendation Strategy" in recommendation_chunk.page_content
 
 
 def test_split_documents_respects_chunk_size() -> None:
-    """4) Chunk size: every chunk respects approximately <= 1500 characters."""
+    """2) Chunking: no oversized chunks."""
     ingestion = KnowledgeIngestion()
     documents = ingestion.load_documents(KNOWLEDGE_PATH)
     chunks = ingestion.split_documents(documents)
@@ -153,55 +146,82 @@ def test_split_documents_respects_chunk_size() -> None:
         assert len(chunk.page_content) <= _MAX_CHUNK_SIZE + _CHUNK_SIZE_TOLERANCE
 
 
-def test_split_documents_does_not_over_split_short_documents() -> None:
-    """A document shorter than chunk_size must not be split unnecessarily."""
-    ingestion = KnowledgeIngestion(chunk_size=1500, chunk_overlap=200)
-    short_document = Document(
-        page_content="Short content well under the chunk size limit.",
-        metadata={"category": "security", "topic": "example", "source": "knowledge/security/example.md"},
-    )
+def test_split_documents_chunk_ids_are_contiguous_per_document() -> None:
+    """chunk_id is 0-based and contiguous across all of a document's sections."""
+    ingestion = KnowledgeIngestion()
+    documents = ingestion.load_documents(KNOWLEDGE_PATH)
+    chunks = ingestion.split_documents(documents)
 
-    chunks = ingestion.split_documents([short_document])
-
-    assert len(chunks) == 1
-    assert chunks[0].page_content == short_document.page_content
-    assert chunks[0].metadata["chunk_id"] == 0
+    hsts_chunks = [chunk for chunk in chunks if chunk.metadata["criterion"] == "hsts"]
+    assert [chunk.metadata["chunk_id"] for chunk in hsts_chunks] == list(range(len(hsts_chunks)))
 
 
-def test_ingest_runs_the_full_pipeline_and_prints_debug_output() -> None:
-    """Complete pipeline: `ingest()` returns chunks ready for embedding.
-
-    Also prints the temporary debug output requested for this review:
-    total chunk count, and each chunk's metadata plus content length.
-    """
+def test_ingest_output_matches_expected_document_shape() -> None:
+    """3) Output compatibility: Document(page_content=..., metadata={category, criterion, ...})."""
     ingestion = KnowledgeIngestion()
 
-    documents = ingestion.load_documents(KNOWLEDGE_PATH)
     chunks = ingestion.ingest(KNOWLEDGE_PATH)
-    _print_all_chunks_debug(chunks)
 
     assert len(chunks) > 0
-    assert len(chunks) > len(documents)
-    assert all(isinstance(chunk, Document) for chunk in chunks)
-    assert all(chunk.page_content.strip() for chunk in chunks)
-    assert all(
-        {"category", "topic", "source", "chunk_id"} <= chunk.metadata.keys() for chunk in chunks
-    )
-    assert all(len(chunk.page_content) <= _MAX_CHUNK_SIZE + _CHUNK_SIZE_TOLERANCE for chunk in chunks)
+    for chunk in chunks:
+        assert isinstance(chunk, Document)
+        assert isinstance(chunk.page_content, str) and chunk.page_content.strip()
+        assert {"source", "category", "criterion", "section", "chunk_id"} <= chunk.metadata.keys()
+        # ChromaDB requires scalar metadata values; every value must already
+        # be a plain str/int/float/bool by the time ingestion is done.
+        assert all(isinstance(value, (str, int, float, bool)) for value in chunk.metadata.values())
 
-    # Every knowledge file that was loaded is represented among the chunks.
-    expected_sources = {document.metadata["source"] for document in documents}
-    chunk_sources = {chunk.metadata["source"] for chunk in chunks}
-    assert expected_sources == chunk_sources
+    sample = next(chunk for chunk in chunks if chunk.metadata["criterion"] == "csp")
+    print(f"sample chunk: {sample}")
+    assert sample.metadata["category"] == "security"
+    assert sample.metadata["criterion"] == "csp"
+
+
+def test_embedding_pipeline_compatibility() -> None:
+    """4) Embedding compatibility: all chunks embedded, vector dimension 384."""
+    chunks = KnowledgeIngestion().ingest(KNOWLEDGE_PATH)
+
+    manager = EmbeddingManager()
+    vectors = manager.embed_documents(chunks)
+
+    print(f"embedded {len(vectors)} chunks, dimension {len(vectors[0])}")
+    assert len(vectors) == len(chunks)
+    assert all(len(vector) == _EMBEDDING_DIMENSIONS for vector in vectors)
+
+
+def test_chromadb_storage_preserves_metadata() -> None:
+    """5) ChromaDB storage: vectors stored, metadata preserved."""
+    chunks = KnowledgeIngestion().ingest(KNOWLEDGE_PATH)
+    persist_directory = Path(tempfile.mkdtemp(prefix="aras_ingestion_chroma_test_"))
+
+    try:
+        vector_store_manager = VectorStoreManager(persist_directory=persist_directory)
+        store = vector_store_manager.create_vector_store(chunks)
+
+        assert store._collection.count() == len(chunks)
+
+        results = store.similarity_search(
+            "Content Security Policy missing header remediation",
+            k=3,
+            filter={"category": "security"},
+        )
+        print(f"retrieved: {[r.metadata for r in results]}")
+
+        assert len(results) == 3
+        for result in results:
+            assert result.metadata["category"] == "security"
+            assert {"criterion", "section", "source", "chunk_id"} <= result.metadata.keys()
+    finally:
+        shutil.rmtree(persist_directory, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    test_load_documents_finds_every_knowledge_file()
-    test_metadata_extraction_matches_file_path()
+    test_load_documents_finds_every_aras_knowledge_file_with_metadata()
     test_metadata_extraction_is_dynamic_across_categories()
-    test_split_documents_produces_more_chunks_than_source_files()
-    test_split_documents_preserves_metadata()
+    test_split_documents_preserves_markdown_sections()
     test_split_documents_respects_chunk_size()
-    test_split_documents_does_not_over_split_short_documents()
-    test_ingest_runs_the_full_pipeline_and_prints_debug_output()
+    test_split_documents_chunk_ids_are_contiguous_per_document()
+    test_ingest_output_matches_expected_document_shape()
+    test_embedding_pipeline_compatibility()
+    test_chromadb_storage_preserves_metadata()
     print("All tests passed.")

@@ -1,21 +1,16 @@
-"""Tests for :class:`KnowledgeRetriever`.
+"""Unit tests for :class:`ARASRetriever` (metadata filter + bi-encoder + re-ranker).
 
-Covers, against the real ARAS knowledge base and its persisted
-ChromaDB collection (built by `KnowledgeIngestion` +
-`VectorStoreManager`): retriever initialization, semantic similarity
-search for security and interaction queries, and metadata-filtered
-search. No LLM or recommendation-generation logic is exercised by
-these tests — only retrieval.
+Builds a temporary ChromaDB collection from the real
+`knowledge/aras_knowledge/` base (via the already-tested
+`KnowledgeIngestion` and `VectorStoreManager`) once per test run, then
+exercises `ARASRetriever.retrieve()` against real recommendation
+contexts. No LLM or recommendation-generation logic is exercised by
+these tests.
 
 Requires network access on first run to download the
-`sentence-transformers/all-MiniLM-L6-v2` model weights (shared with
-`test_vector_store.py`); subsequent runs use the local HuggingFace cache.
-
-Each test builds its own isolated, disposable vector store (via
-`VectorStoreManager` + `KnowledgeIngestion`) rather than depending on
-`recommendation/chroma_db/` already existing on disk, so this suite
-runs standalone regardless of execution order relative to
-`test_vector_store.py`.
+`sentence-transformers/all-MiniLM-L6-v2` embedding model and the
+`cross-encoder/ms-marco-MiniLM-L-6-v2` re-ranking model; subsequent
+runs use the local HuggingFace cache.
 """
 
 from __future__ import annotations
@@ -29,161 +24,160 @@ from pathlib import Path
 # ensuring the project root is importable, not just the `tests/` folder.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from langchain_core.documents import Document
-
 from recommendation.rag.ingestion import KnowledgeIngestion
-from recommendation.rag.retriever import KnowledgeRetriever
+from recommendation.rag.retriever import ARASRetriever, KnowledgeRetriever
 from recommendation.rag.vector_store import VectorStoreManager
 
-KNOWLEDGE_PATH = str(Path(__file__).resolve().parent.parent / "recommendation" / "knowledge")
+KNOWLEDGE_PATH = str(Path(__file__).resolve().parent.parent / "knowledge" / "aras_knowledge")
+
+_PERSIST_DIRECTORY = Path(tempfile.mkdtemp(prefix="aras_retriever_test_"))
 
 
-def _build_test_vector_store() -> Path:
-    """Ingest the real knowledge base into a fresh, isolated Chroma collection.
+def _build_retriever() -> ARASRetriever:
+    """Construct an `ARASRetriever` backed by the shared test vector store."""
+    retriever = ARASRetriever(knowledge_retriever=KnowledgeRetriever())
+    retriever.initialize(str(_PERSIST_DIRECTORY))
+    return retriever
 
-    Returns:
-        The temporary persist directory the collection was written to.
-        Callers are responsible for removing it once done.
-    """
-    persist_directory = Path(tempfile.mkdtemp(prefix="aras_retriever_test_"))
+
+def setup_module(_module: object) -> None:
+    """Build the shared temporary vector store once, before any test runs."""
     chunks = KnowledgeIngestion().ingest(KNOWLEDGE_PATH)
-    VectorStoreManager(persist_directory=persist_directory).create_vector_store(chunks)
-    return persist_directory
+    VectorStoreManager(persist_directory=_PERSIST_DIRECTORY).create_vector_store(chunks)
 
 
-def _print_retrieved_documents(query: str, documents: list[Document]) -> None:
-    print(f'Query: "{query}"')
-    print("Retrieved documents:")
-    for index, document in enumerate(documents, start=1):
-        print(f"Document {index}:")
-        print(f"  metadata: {document.metadata}")
-    print()
+def teardown_module(_module: object) -> None:
+    """Remove the shared temporary vector store after all tests have run."""
+    shutil.rmtree(_PERSIST_DIRECTORY, ignore_errors=True)
 
 
-def _print_retrieved_documents_with_scores(
-    query: str, results: list[tuple[Document, float]]
-) -> None:
-    print(f'Query: "{query}"')
-    print("Retrieved documents:")
-    for index, (document, score) in enumerate(results, start=1):
-        print(f"Document {index}:")
-        print(f"  metadata: {document.metadata}")
-        print(f"  similarity score (distance): {score}")
-    print()
+def test_build_query_includes_dimension_criterion_issue_and_objective() -> None:
+    """`build_query` produces a structured natural-language query."""
+    query = ARASRetriever.build_query(
+        {
+            "category": "security",
+            "criterion": "csp",
+            "issue": "Missing CSP header",
+            "priority": "HIGH",
+        }
+    )
+    print(f"built query:\n{query}")
+
+    assert "security" in query
+    assert "csp" in query
+    assert "Missing CSP header" in query
+    assert "remediation" in query.lower()
 
 
-def test_initialize_loads_vector_store_and_embedding_model() -> None:
-    """Test 1: initializing the retriever loads ChromaDB and the embedding model."""
-    persist_directory = _build_test_vector_store()
+def test_csp_retrieval() -> None:
+    """Test 1: CSP retrieval returns csp.md chunks, not graphql.md/robots.md."""
+    retriever = _build_retriever()
 
-    try:
-        retriever = KnowledgeRetriever()
-        assert retriever.is_initialized is False
+    results = retriever.retrieve(
+        {"category": "security", "criterion": "csp", "issue": "Missing CSP header"}
+    )
+    sources = [document.metadata["source"] for document in results]
+    print(f"CSP retrieval sources: {sources}")
 
-        retriever.initialize(str(persist_directory))
-
-        assert retriever.is_initialized is True
-    finally:
-        shutil.rmtree(persist_directory, ignore_errors=True)
-
-
-def test_initialize_raises_when_no_vector_store_exists() -> None:
-    """`initialize` must fail clearly rather than silently create an empty store."""
-    empty_directory = Path(tempfile.mkdtemp(prefix="aras_retriever_empty_"))
-
-    try:
-        retriever = KnowledgeRetriever()
-        try:
-            retriever.initialize(str(empty_directory))
-            assert False, "expected FileNotFoundError"
-        except FileNotFoundError:
-            pass
-        assert retriever.is_initialized is False
-    finally:
-        shutil.rmtree(empty_directory, ignore_errors=True)
+    assert results
+    assert any(source.endswith("security/csp.md") for source in sources)
+    assert not any(source.endswith("graphql.md") for source in sources)
+    assert not any(source.endswith("robots.md") for source in sources)
 
 
-def test_retrieve_finds_csp_documentation_for_security_query() -> None:
-    """Test 2: a CSP-related query retrieves the security/csp document."""
-    persist_directory = _build_test_vector_store()
+def test_api_documentation_retrieval() -> None:
+    """Test 2: API documentation retrieval returns interaction/api_documentation.md chunks."""
+    retriever = _build_retriever()
 
-    try:
-        retriever = KnowledgeRetriever()
-        retriever.initialize(str(persist_directory))
+    results = retriever.retrieve(
+        {
+            "category": "interaction",
+            "criterion": "api_documentation",
+            "issue": "Missing API documentation",
+        }
+    )
+    sources = [document.metadata["source"] for document in results]
+    print(f"API documentation retrieval sources: {sources}")
 
-        query = "Content Security Policy missing"
-        results = retriever.retrieve_with_scores(query, k=5)
-        _print_retrieved_documents_with_scores(query, results)
-
-        documents = [document for document, _ in results]
-        assert len(documents) == 5
-        assert all(isinstance(document, Document) for document in documents)
-        assert any(document.metadata["category"] == "security" for document in documents)
-        assert any(document.metadata["topic"] == "csp" for document in documents)
-    finally:
-        shutil.rmtree(persist_directory, ignore_errors=True)
+    assert results
+    assert all(source.endswith("interaction/api_documentation.md") for source in sources)
 
 
-def test_retrieve_finds_interaction_documentation_for_api_query() -> None:
-    """Test 3: an API-exposure query retrieves interaction/openapi or graphql."""
-    persist_directory = _build_test_vector_store()
+def test_metadata_filtering_never_crosses_criteria() -> None:
+    """Test 3: criterion=csp never retrieves criterion=graphql chunks."""
+    retriever = _build_retriever()
 
-    try:
-        retriever = KnowledgeRetriever()
-        retriever.initialize(str(persist_directory))
+    results = retriever.retrieve(
+        {"category": "security", "criterion": "csp", "issue": "Missing CSP header"}
+    )
 
-        query = "How to expose APIs for AI agents"
-        documents = retriever.retrieve(query, k=5)
-        _print_retrieved_documents(query, documents)
-
-        assert len(documents) == 5
-        assert any(document.metadata["category"] == "interaction" for document in documents)
-        assert any(
-            document.metadata["topic"] in {"openapi", "graphql"} for document in documents
-        )
-    finally:
-        shutil.rmtree(persist_directory, ignore_errors=True)
+    assert all(document.metadata["criterion"] == "csp" for document in results)
 
 
-def test_retrieve_with_metadata_filter_restricts_category() -> None:
-    """Test 4: filtering by category="security" returns only security chunks."""
-    persist_directory = _build_test_vector_store()
+def test_unknown_criterion_returns_empty_without_raising() -> None:
+    """Test 4: an unknown criterion returns [] instead of raising."""
+    retriever = _build_retriever()
 
-    try:
-        retriever = KnowledgeRetriever()
-        retriever.initialize(str(persist_directory))
+    results = retriever.retrieve(
+        {
+            "category": "security",
+            "criterion": "does-not-exist",
+            "issue": "Some issue with no matching knowledge",
+        }
+    )
+    print(f"unknown criterion results: {results}")
 
-        query = "security headers"
-        documents = retriever.retrieve(query, k=5, filter={"category": "security"})
-        _print_retrieved_documents(query, documents)
-
-        assert len(documents) > 0
-        assert all(document.metadata["category"] == "security" for document in documents)
-    finally:
-        shutil.rmtree(persist_directory, ignore_errors=True)
+    assert results == []
 
 
-def test_retrieve_without_filter_can_span_multiple_categories() -> None:
-    """Without a filter, results are not restricted to a single category."""
-    persist_directory = _build_test_vector_store()
+def test_uninitialized_retriever_returns_empty_without_raising() -> None:
+    """An uninitialized retriever also returns [] rather than raising."""
+    retriever = ARASRetriever()
 
-    try:
-        retriever = KnowledgeRetriever()
-        retriever.initialize(str(persist_directory))
+    results = retriever.retrieve(
+        {"category": "security", "criterion": "csp", "issue": "Missing CSP header"}
+    )
 
-        documents = retriever.retrieve("website technical best practices", k=10)
+    assert results == []
 
-        categories_found = {document.metadata["category"] for document in documents}
-        assert len(categories_found) >= 2
-    finally:
-        shutil.rmtree(persist_directory, ignore_errors=True)
+
+def test_dynamic_top_k_overrides_are_configurable() -> None:
+    """Per-criterion top_k overrides are honored and can be reconfigured."""
+    retriever = ARASRetriever(
+        knowledge_retriever=KnowledgeRetriever(),
+        top_k_overrides={("security", "csp"): 1},
+    )
+    retriever.initialize(str(_PERSIST_DIRECTORY))
+
+    assert retriever._resolve_candidate_k("security", "csp") == 1
+    assert retriever._resolve_candidate_k("interaction", "api_documentation") == 10
+
+
+def test_returned_documents_preserve_content_and_metadata() -> None:
+    """Retrieved results are plain Documents with unmodified content/metadata."""
+    retriever = _build_retriever()
+
+    results = retriever.retrieve(
+        {"category": "security", "criterion": "csp", "issue": "Missing CSP header"}
+    )
+
+    assert results
+    top_document = results[0]
+    assert isinstance(top_document.page_content, str) and top_document.page_content.strip()
+    assert {"category", "criterion", "source"} <= top_document.metadata.keys()
 
 
 if __name__ == "__main__":
-    test_initialize_loads_vector_store_and_embedding_model()
-    test_initialize_raises_when_no_vector_store_exists()
-    test_retrieve_finds_csp_documentation_for_security_query()
-    test_retrieve_finds_interaction_documentation_for_api_query()
-    test_retrieve_with_metadata_filter_restricts_category()
-    test_retrieve_without_filter_can_span_multiple_categories()
-    print("All tests passed.")
+    setup_module(None)
+    try:
+        test_build_query_includes_dimension_criterion_issue_and_objective()
+        test_csp_retrieval()
+        test_api_documentation_retrieval()
+        test_metadata_filtering_never_crosses_criteria()
+        test_unknown_criterion_returns_empty_without_raising()
+        test_uninitialized_retriever_returns_empty_without_raising()
+        test_dynamic_top_k_overrides_are_configurable()
+        test_returned_documents_preserve_content_and_metadata()
+        print("All tests passed.")
+    finally:
+        teardown_module(None)

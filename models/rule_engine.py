@@ -19,9 +19,16 @@ class ClassifiedIssue:
 
     This is the Rule Engine's atomic unit of output: one detected
     readiness gap, tagged with the dimension it belongs to, a
-    deterministic priority, and the knowledge-base topic the future
-    RAG Retriever should search for when generating a recommendation
-    for it.
+    deterministic priority, and everything the RAG Retriever and
+    Recommendation Agent need to act on it directly — no re-reading of
+    the original analysis results required.
+
+    `category`/`issue`/`priority`/`knowledge_topic`/`reason` are the
+    original (unchanged) fields every existing caller already reads.
+    `criterion`/`score`/`evidence`/`retrieval_query`/`metadata` are
+    additive RAG-oriented fields: none of them affect issue detection
+    or priority, they only expose already-computed information in a
+    shape the retrieval layer can consume directly.
 
     Attributes:
         category: The ARAS dimension the issue was reported by
@@ -31,12 +38,32 @@ class ClassifiedIssue:
             analysis agent.
         priority: Deterministic severity classification —
             `"HIGH"`, `"MEDIUM"`, or `"LOW"`.
-        knowledge_topic: The knowledge-base topic (matching a filename
-            under `recommendation/knowledge/<category>/`, e.g. `"csp"`,
-            `"jsonld"`, `"openapi"`) the Recommendation Agent should
-            retrieve documentation for.
+        knowledge_topic: Legacy knowledge-base topic, kept for backward
+            compatibility with existing callers. Prefer `criterion`,
+            which is guaranteed to match a real
+            `knowledge/aras_knowledge/<category>/<criterion>.md`
+            document's `criterion` frontmatter field; `knowledge_topic`
+            predates that knowledge base and is not always accurate.
         reason: A short, human-readable justification for the assigned
             priority.
+        criterion: The exact ARAS criterion this issue was evaluated
+            against (e.g. `"csp"`, `"json_ld"`, `"api_documentation"`),
+            matching both the analysis agent's `checks` key and the
+            ARAS knowledge base's `criterion` frontmatter field for
+            this category.
+        score: The issue's ARAS dimension's overall score in [0, 100],
+            as already computed by the corresponding analysis agent
+            (no per-criterion score is computed upstream, so this is
+            the most granular already-calculated score available).
+        evidence: The raw evaluation evidence behind this issue, e.g.
+            `{"csp": False}` — the analysis agent's own pass/fail
+            outcome for `criterion`. Empty if the analysis result
+            didn't expose a `checks` mapping.
+        retrieval_query: `{"category": ..., "criterion": ...}`, ready
+            to pass directly to the RAG Retriever as a metadata filter.
+        metadata: Optional additional context for future extensions
+            (e.g. detected framework/technology), empty unless already
+            available — never populated by additional analysis.
     """
 
     category: str
@@ -44,6 +71,11 @@ class ClassifiedIssue:
     priority: str
     knowledge_topic: str
     reason: str
+    criterion: str = ""
+    score: float = 0.0
+    evidence: dict[str, Any] = field(default_factory=dict)
+    retrieval_query: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert this issue into a plain JSON-serializable dict.

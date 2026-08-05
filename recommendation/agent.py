@@ -2,10 +2,11 @@
 
 This module is the final analysis layer of ARAS. It turns each
 `ClassifiedIssue` produced by the Rule Engine into a professional,
-actionable `Recommendation`, by retrieving grounding documentation
-from the RAG knowledge base and asking an `LLMClient` to expand it
-into an explanation, a recommendation, and concrete implementation
-steps.
+actionable `Recommendation`, by retrieving grounding documentation from
+the RAG knowledge base (`ARASRetriever`: metadata filter + bi-encoder +
+cross-encoder re-rank) and asking an `LLMClient` to expand it into an
+explanation, impact, recommendation, implementation steps, best
+practices, expected benefits, and references.
 
 This agent MUST NOT:
     - collect website evidence
@@ -18,8 +19,8 @@ This agent MUST NOT:
     - duplicate retriever, embedding, vector-store, or rule-engine logic
 
 Those responsibilities belong to earlier ARAS layers. This agent only
-orchestrates already-built components: `KnowledgeRetriever`,
-`PromptBuilder`, and `LLMClient`.
+orchestrates already-built components: `ARASRetriever`, `PromptBuilder`,
+and `LLMClient`.
 """
 
 from __future__ import annotations
@@ -33,15 +34,42 @@ from models.recommendation import Recommendation, RecommendationResult
 from models.rule_engine import ClassifiedIssue
 from recommendation.llm_client import GroqLLMClient, LLMClient
 from recommendation.prompt_builder import (
+    BEST_PRACTICES_HEADER,
+    EXPECTED_BENEFITS_HEADER,
     EXPLANATION_HEADER,
+    IMPACT_HEADER,
     IMPLEMENTATION_STEPS_HEADER,
     RECOMMENDATION_HEADER,
+    RESPONSE_HEADERS,
     PromptBuilder,
 )
-from recommendation.rag.retriever import KnowledgeRetriever
+from recommendation.rag.retriever import ARASRetriever
 
-_DEFAULT_RETRIEVAL_K = 3
 _PRIORITY_LEVELS = ("HIGH", "MEDIUM", "LOW")
+_PRIORITY_RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+
+# Criteria that are technically distinct (different evaluation logic, kept
+# separate in RuleEngineResult/scoring/retrieval) but read as the same
+# real-world fix to a report reader — merged for recommendation purposes
+# only. `discoverability/api_discoverability` ("is any API surface visible
+# at all") and `interaction/api_documentation` ("is there formal API
+# documentation") both resolve to "publish OpenAPI/Swagger docs" in
+# practice, since they inspect overlapping evidence and almost always
+# fail together. Maps a criterion to the canonical criterion its merge
+# group is keyed by; a criterion absent from this table is its own group.
+_CRITERION_MERGE_GROUPS: dict[str, str] = {
+    "api_discoverability": "api_documentation",
+}
+
+_MISSING_KNOWLEDGE_NOTE = (
+    " No specific ARAS knowledge base documentation was retrieved for this "
+    "issue; this recommendation is based on general best practices only."
+)
+_GENERATION_FAILED_EXPLANATION = (
+    "Automated recommendation generation is temporarily unavailable for this "
+    "issue. The details below are a structured fallback derived directly "
+    "from the Rule Engine's own classification, not from the LLM."
+)
 
 
 class RecommendationAgent:
@@ -49,25 +77,29 @@ class RecommendationAgent:
 
     This class holds no retrieval, embedding, vector-storage, or
     priority-classification logic of its own — it delegates entirely
-    to an already-built `KnowledgeRetriever`, `PromptBuilder`, and
-    `LLMClient`, and only orchestrates the flow between them.
+    to an already-built `ARASRetriever`, `PromptBuilder`, and
+    `LLMClient`, and only orchestrates the flow between them:
+
+        ClassifiedIssue -> ARASRetriever.retrieve() -> Documents
+                         -> PromptBuilder.build() -> prompt
+                         -> LLMClient.invoke() -> raw response
+                         -> Recommendation
     """
 
     def __init__(
         self,
-        retriever: Optional[KnowledgeRetriever] = None,
+        retriever: Optional[ARASRetriever] = None,
         prompt_builder: Optional[PromptBuilder] = None,
         llm_client: Optional[LLMClient] = None,
-        retrieval_k: int = _DEFAULT_RETRIEVAL_K,
     ) -> None:
         """Configure the Recommendation Agent's collaborators.
 
         Args:
-            retriever: A `KnowledgeRetriever`, ideally already
-                initialized via `retriever.initialize(vector_store_path)`.
-                If omitted, an uninitialized `KnowledgeRetriever` is
-                used, which causes every issue to fall back to
-                generation without retrieved documentation (see
+            retriever: An `ARASRetriever`, ideally already initialized
+                via `retriever.initialize(vector_store_path)`. If
+                omitted, an uninitialized `ARASRetriever` is used,
+                which causes every issue to fall back to generation
+                without retrieved documentation (see
                 `_retrieve_documents`) — retrieval failure is handled
                 gracefully, not treated as fatal.
             prompt_builder: The prompt builder to use. A default
@@ -77,15 +109,24 @@ class RecommendationAgent:
                 `GROQ_API_KEY`), and can be swapped for any other
                 `LLMClient` implementation — e.g. `TemplateLLMClient`
                 for offline tests — without changing this class.
-            retrieval_k: Number of documents to retrieve per issue.
         """
-        self._retriever = retriever or KnowledgeRetriever()
+        self._retriever = retriever or ARASRetriever()
         self._prompt_builder = prompt_builder or PromptBuilder()
         self._llm_client = llm_client or GroqLLMClient()
-        self._retrieval_k = retrieval_k
 
     def generate(self, classified_issues: list[ClassifiedIssue]) -> RecommendationResult:
         """Generate a recommendation for every classified issue.
+
+        Issues sharing the same `criterion` (e.g. `open_graph`,
+        independently checked by both `DiscoverabilityAgent` and
+        `ComprehensionAgent` against the exact same evidence) are
+        merged into a single representative issue first — see
+        `_merge_duplicate_criteria` — so the reader gets one grounded
+        recommendation per real technical gap instead of two
+        near-identical ones differing only in category/priority. The
+        Rule Engine's own output (`RuleEngineResult.issues`/`summary`,
+        each dimension's own score) is never touched by this merge —
+        it only affects which issues are handed to the LLM here.
 
         Args:
             classified_issues: The Rule Engine's output — one
@@ -93,14 +134,98 @@ class RecommendationAgent:
 
         Returns:
             A `RecommendationResult` with one `Recommendation` per
-            input issue and a priority-level summary count.
+            merged issue and a priority-level summary count.
         """
-        recommendations = [
-            self._generate_one(classified_issue) for classified_issue in classified_issues
-        ]
+        merged_issues = self._merge_duplicate_criteria(classified_issues)
+        recommendations = [self._generate_one(issue) for issue in merged_issues]
         return RecommendationResult(
             recommendations=recommendations,
             summary=self._summarize(recommendations),
+        )
+
+    # ------------------------------------------------------------------
+    # Merging issues that share the same criterion
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _merge_duplicate_criteria(classified_issues: list[ClassifiedIssue]) -> list[ClassifiedIssue]:
+        """Merge issues that share the same `criterion` into one representative issue.
+
+        Grouping is by `criterion` only (not by issue text or
+        category), since `criterion` is the ARAS-canonical identity of
+        "which technical gap is this" — two issues with the same
+        criterion are, by definition, the same underlying gap reported
+        by more than one analysis agent. An issue with an empty
+        `criterion` (e.g. a hand-built test double that omits it) is
+        never merged with anything else, to avoid accidentally
+        collapsing unrelated issues that all happen to default to "".
+        Grouping key is `_CRITERION_MERGE_GROUPS.get(criterion,
+        criterion)`, so criteria that are technically distinct but
+        represent the same real-world fix (see that table) are merged
+        too, not just byte-identical criteria.
+
+        Args:
+            classified_issues: The Rule Engine's raw output.
+
+        Returns:
+            One issue per distinct merge group, in first-seen order;
+            single-issue groups are returned unchanged.
+        """
+        groups: dict[str, list[ClassifiedIssue]] = {}
+        order: list[str] = []
+        for index, issue in enumerate(classified_issues):
+            if issue.criterion:
+                key = _CRITERION_MERGE_GROUPS.get(issue.criterion, issue.criterion)
+            else:
+                key = f"__no_criterion_{index}"
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(issue)
+
+        return [
+            groups[key][0] if len(groups[key]) == 1 else RecommendationAgent._combine(groups[key])
+            for key in order
+        ]
+
+    @staticmethod
+    def _combine(group: list[ClassifiedIssue]) -> ClassifiedIssue:
+        """Combine several same-group issues into one representative issue.
+
+        The representative issue's own message is used as-is (a single,
+        clean sentence) rather than concatenating every member's
+        wording — a reader should see one clear statement of the gap,
+        not "message A / message B". Everything else (evidence,
+        affected categories) is still merged, just not surfaced as the
+        headline text.
+
+        Args:
+            group: Two or more `ClassifiedIssue`s in the same merge group.
+
+        Returns:
+            A single `ClassifiedIssue`: highest priority in the group,
+            its own issue message, every distinct category combined,
+            and evidence merged from every member — used only to drive
+            recommendation generation, never fed back into
+            `RuleEngineResult`.
+        """
+        primary = min(group, key=lambda issue: _PRIORITY_RANK.get(issue.priority, len(_PRIORITY_RANK)))
+        categories = sorted({issue.category for issue in group})
+        combined_evidence: dict = {}
+        for issue in group:
+            combined_evidence.update(issue.evidence)
+
+        return ClassifiedIssue(
+            category=", ".join(categories),
+            issue=primary.issue,
+            priority=primary.priority,
+            knowledge_topic=primary.knowledge_topic,
+            reason=primary.reason,
+            criterion=primary.criterion,
+            score=primary.score,
+            evidence=combined_evidence,
+            retrieval_query={"category": primary.category, "criterion": primary.criterion},
+            metadata=primary.metadata,
         )
 
     # ------------------------------------------------------------------
@@ -114,97 +239,57 @@ class RecommendationAgent:
             classified_issue: The issue to generate a recommendation for.
 
         Returns:
-            The resulting `Recommendation`, either LLM-generated (Step
-            4) or a structured fallback if the LLM call fails.
+            The resulting `Recommendation`, either LLM-generated or a
+            structured fallback if the LLM call fails. Never raises —
+            a single issue's generation failure never aborts the rest
+            of the ARAS workflow.
         """
         documents = self._retrieve_documents(classified_issue)
-        context = self._build_context(documents)
-        prompt = self._prompt_builder.build_recommendation_prompt(
-            issue=classified_issue.issue,
-            priority=classified_issue.priority,
-            category=classified_issue.category,
-            context=context,
-        )
+        prompt = self._prompt_builder.build(classified_issue, documents)
 
         try:
-            raw_response = self._llm_client.generate(prompt)
+            raw_response = self._llm_client.invoke(prompt)
             return self._parse_response(raw_response, classified_issue, documents)
-        except Exception:  # noqa: BLE001 - Case 2: LLM failure -> structured fallback
+        except Exception:  # noqa: BLE001 - LLM failure -> structured fallback, don't crash
             return self._fallback_recommendation(classified_issue, documents)
 
     # ------------------------------------------------------------------
-    # Step 1 + 2: RAG query and retrieval
+    # Step 1: retrieval
     # ------------------------------------------------------------------
 
     def _retrieve_documents(self, classified_issue: ClassifiedIssue) -> list[Document]:
         """Retrieve knowledge documents relevant to a classified issue.
 
-        Case 1 (no retriever available, or retrieval fails) is handled
-        by returning an empty list rather than raising — the caller
-        then generates a recommendation from the issue information
-        alone.
+        No documents available (retriever not initialized, retrieval
+        raises, or nothing matched) is handled by returning an empty
+        list rather than raising — the caller then generates a
+        recommendation from the issue information alone, and
+        `PromptBuilder` substitutes a "no knowledge retrieved"
+        placeholder so this degradation is visible in the prompt
+        itself, not silently hidden.
 
         Args:
             classified_issue: The issue to retrieve documentation for.
 
         Returns:
-            Up to `retrieval_k` retrieved `Document` chunks, or `[]`.
+            The `Document` chunks `ARASRetriever.retrieve` returns for
+            this issue, or `[]`.
         """
         if not self._retriever.is_initialized:
             return []
 
-        query = self._build_query(classified_issue)
         try:
-            return self._retriever.retrieve(
-                query,
-                k=self._retrieval_k,
-                filter={"category": classified_issue.category},
-            )
-        except Exception:  # noqa: BLE001 - Case 1: no documents -> generate without context
+            return self._retriever.retrieve(classified_issue.to_dict())
+        except Exception:  # noqa: BLE001 - no documents -> generate without context
             return []
-
-    @staticmethod
-    def _build_query(classified_issue: ClassifiedIssue) -> str:
-        """Build the RAG query for a classified issue.
-
-        Combines `category`, `issue`, and `knowledge_topic` — e.g. for
-        `{"category": "security", "issue": "Missing Content Security
-        Policy", "knowledge_topic": "csp"}` this produces `"security
-        Missing Content Security Policy csp implementation"`.
-
-        Args:
-            classified_issue: The issue to build a query for.
-
-        Returns:
-            The query string to pass to `KnowledgeRetriever.retrieve`.
-        """
-        return (
-            f"{classified_issue.category} {classified_issue.issue} "
-            f"{classified_issue.knowledge_topic} implementation"
-        )
-
-    @staticmethod
-    def _build_context(documents: list[Document]) -> str:
-        """Format retrieved documents into the prompt's knowledge context.
-
-        Args:
-            documents: Retrieved document chunks, possibly empty.
-
-        Returns:
-            A plain-text block combining every chunk's content and
-            source, or an empty string if no documents were retrieved
-            (in which case `PromptBuilder` substitutes a placeholder).
-        """
-        if not documents:
-            return ""
-        return "\n\n".join(
-            f"[{document.metadata.get('source', 'unknown')}]\n{document.page_content}"
-            for document in documents
-        )
 
     @staticmethod
     def _references_of(documents: list[Document]) -> list[str]:
         """Collect deduplicated knowledge-base source paths from retrieved documents.
+
+        Always derived from the documents actually retrieved, never
+        from LLM-generated text, so a recommendation can never cite a
+        source it wasn't really grounded in.
 
         Args:
             documents: Retrieved document chunks, possibly empty.
@@ -234,33 +319,46 @@ class RecommendationAgent:
         """Convert a raw LLM response into a `Recommendation`.
 
         Args:
-            raw_response: The `LLMClient.generate` output, expected to
-                follow the `EXPLANATION:` / `RECOMMENDATION:` /
-                `IMPLEMENTATION STEPS:` structure `PromptBuilder` asks for.
+            raw_response: The `LLMClient.invoke` output, expected to
+                follow the `PromptBuilder.RESPONSE_HEADERS` structure.
             classified_issue: The issue this response was generated for.
             documents: The documents retrieved for this issue, used for
-                `references`.
+                `references` (never for LLM-claimed references — see
+                `_references_of`).
 
         Returns:
             The resulting `Recommendation`, falling back to
             issue-derived text for any section the response omitted.
         """
         sections = self._split_sections(raw_response)
+        missing_knowledge_suffix = _MISSING_KNOWLEDGE_NOTE if not documents else ""
 
-        explanation = sections.get(EXPLANATION_HEADER, "").strip() or classified_issue.reason
+        explanation = (
+            sections.get(EXPLANATION_HEADER, "").strip() or classified_issue.reason
+        ) + missing_knowledge_suffix
+        impact = sections.get(IMPACT_HEADER, "").strip() or (
+            f"Leaving this issue unaddressed reduces the {classified_issue.category} "
+            "dimension's Agentic Readiness score."
+        )
         recommendation_text = (
             sections.get(RECOMMENDATION_HEADER, "").strip()
             or f"Address the following issue: {classified_issue.issue}."
         )
-        steps = self._parse_steps(sections.get(IMPLEMENTATION_STEPS_HEADER, ""))
+        steps = self._parse_bullets(sections.get(IMPLEMENTATION_STEPS_HEADER, ""))
+        best_practices = self._parse_bullets(sections.get(BEST_PRACTICES_HEADER, ""))
+        expected_benefits = sections.get(EXPECTED_BENEFITS_HEADER, "").strip()
 
         return Recommendation(
             category=classified_issue.category,
+            criterion=classified_issue.criterion,
             issue=classified_issue.issue,
             priority=classified_issue.priority,
             explanation=explanation,
+            impact=impact,
             recommendation=recommendation_text,
             implementation_steps=steps,
+            best_practices=best_practices,
+            expected_benefits=expected_benefits,
             references=self._references_of(documents),
         )
 
@@ -273,14 +371,12 @@ class RecommendationAgent:
 
         Returns:
             A dict mapping each header found in `raw_response` (from
-            `EXPLANATION_HEADER`, `RECOMMENDATION_HEADER`,
-            `IMPLEMENTATION_STEPS_HEADER`) to the text following it, up
-            to the next header or the end of the response.
+            `PromptBuilder.RESPONSE_HEADERS`) to the text following it,
+            up to the next header or the end of the response.
         """
-        headers = (EXPLANATION_HEADER, RECOMMENDATION_HEADER, IMPLEMENTATION_STEPS_HEADER)
         positions = sorted(
             (raw_response.find(header), header)
-            for header in headers
+            for header in RESPONSE_HEADERS
             if raw_response.find(header) != -1
         )
 
@@ -292,23 +388,23 @@ class RecommendationAgent:
         return sections
 
     @staticmethod
-    def _parse_steps(steps_text: str) -> list[str]:
+    def _parse_bullets(text: str) -> list[str]:
         """Extract a bullet list's items from a block of text.
 
         Args:
-            steps_text: Text containing lines starting with `-`.
+            text: Text containing lines starting with `-`.
 
         Returns:
             Each bullet's text, with the leading `-` removed.
         """
         return [
             line.lstrip("-").strip()
-            for line in steps_text.splitlines()
+            for line in text.splitlines()
             if line.strip().startswith("-")
         ]
 
     # ------------------------------------------------------------------
-    # Case 2: structured fallback when the LLM call fails
+    # LLM failure: structured fallback (error state, never a crash)
     # ------------------------------------------------------------------
 
     def _fallback_recommendation(
@@ -318,11 +414,12 @@ class RecommendationAgent:
     ) -> Recommendation:
         """Build a structured recommendation without calling the LLM.
 
-        Used when `LLMClient.generate` raises. Grounds the fallback in
+        Used when `LLMClient.invoke` raises. Grounds the fallback in
         the top retrieved document's own Markdown sections when
-        available (its "Purpose", "Implementation Guidelines", and
-        "Best Practices" sections), or in the classified issue alone
-        if no documents were retrieved.
+        available (its "Common Issues" and "Recommendation Strategy"
+        sections, per the ARAS knowledge base template), or in the
+        classified issue alone if no documents were retrieved. This is
+        an explicit error state — never a workflow crash.
 
         Args:
             classified_issue: The issue to generate a fallback for.
@@ -334,36 +431,43 @@ class RecommendationAgent:
         """
         top_document = documents[0] if documents else None
 
-        explanation = classified_issue.reason
+        explanation = f"{_GENERATION_FAILED_EXPLANATION} Reason: {classified_issue.reason}"
+        impact = (
+            f"Leaving this issue unaddressed reduces the {classified_issue.category} "
+            "dimension's Agentic Readiness score."
+        )
         recommendation_text = f"Address the following issue: {classified_issue.issue}."
         steps: list[str] = []
+        best_practices: list[str] = []
 
         if top_document is not None:
-            purpose = self._extract_markdown_section(top_document.page_content, "Purpose")
-            if purpose:
-                explanation = self._first_sentence(purpose) or explanation
-
-            guidelines = self._extract_markdown_section(
-                top_document.page_content, "Implementation Guidelines"
+            recommendation_strategy = self._extract_markdown_section(
+                top_document.page_content, "Recommendation Strategy"
             )
-            if guidelines:
-                recommendation_text = self._first_sentence(guidelines) or recommendation_text
+            if recommendation_strategy:
+                recommendation_text = self._first_sentence(recommendation_strategy) or recommendation_text
 
-            best_practices = self._extract_markdown_section(
-                top_document.page_content, "Best Practices"
+            steps = self._extract_bullet_list(
+                self._extract_markdown_section(top_document.page_content, "Implementation Guidance")
             )
-            steps = self._extract_bullet_list(best_practices)
+            best_practices = self._extract_bullet_list(
+                self._extract_markdown_section(top_document.page_content, "Validation Checklist")
+            )
 
         if not steps:
-            steps = [f"Consult the '{classified_issue.knowledge_topic}' documentation and apply its guidance."]
+            steps = [f"Consult the '{classified_issue.criterion}' documentation and apply its guidance."]
 
         return Recommendation(
             category=classified_issue.category,
+            criterion=classified_issue.criterion,
             issue=classified_issue.issue,
             priority=classified_issue.priority,
             explanation=explanation,
+            impact=impact,
             recommendation=recommendation_text,
             implementation_steps=steps,
+            best_practices=best_practices,
+            expected_benefits="",
             references=self._references_of(documents),
         )
 

@@ -18,33 +18,48 @@ class Recommendation:
     """A single, professional recommendation generated for one classified issue.
 
     This is the Recommendation Agent's atomic unit of output: one
-    `ClassifiedIssue` (from the Rule Engine), expanded into an
-    explanation, an actionable recommendation, concrete implementation
-    steps, and the knowledge-base sources it was grounded in.
+    `ClassifiedIssue` (from the Rule Engine), expanded via RAG
+    retrieval + LLM generation into an explanation, an impact
+    statement, an actionable recommendation, concrete implementation
+    steps, best practices, expected benefits, and the knowledge-base
+    sources it was grounded in.
 
     Attributes:
         category: The ARAS dimension the underlying issue belongs to
             (`"discoverability"`, `"comprehension"`, `"interaction"`,
             or `"security"`), carried over unchanged from the
             `ClassifiedIssue` that produced this recommendation.
+        criterion: The exact ARAS criterion this recommendation
+            addresses (e.g. `"csp"`, `"json_ld"`), carried over
+            unchanged from `ClassifiedIssue.criterion`.
         issue: The original issue message, carried over unchanged.
         priority: The deterministic priority assigned by the Rule
             Engine, carried over unchanged — the Recommendation Agent
             never re-classifies or overrides it.
         explanation: A short explanation of why this issue matters.
+        impact: The consequence of leaving this issue unaddressed.
         recommendation: A concise, actionable recommendation statement.
         implementation_steps: Concrete steps to implement the fix.
+        best_practices: Supporting best practices for this criterion.
+        expected_benefits: The benefit of implementing the recommendation.
         references: Knowledge-base source paths (e.g.
-            `"knowledge/security/csp.md"`) the recommendation was
-            grounded in, empty if no relevant documentation was found.
+            `"aras_knowledge/security/csp.md"`) the recommendation was
+            grounded in — always derived from the documents actually
+            retrieved for this issue, never from LLM-generated text,
+            so this field can never cite a source that wasn't really
+            used. Empty if no relevant documentation was found.
     """
 
     category: str
+    criterion: str
     issue: str
     priority: str
     explanation: str
+    impact: str
     recommendation: str
     implementation_steps: list[str] = field(default_factory=list)
+    best_practices: list[str] = field(default_factory=list)
+    expected_benefits: str = ""
     references: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
